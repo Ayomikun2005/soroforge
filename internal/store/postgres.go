@@ -108,6 +108,9 @@ FROM contracts
 WHERE ($1 = '' OR network = $1)
 ORDER BY network, alias`
 
+const listContractsPageSQL = listContractsSQL + `
+LIMIT $2 OFFSET $3`
+
 // ListContracts implements Store.
 func (p *Postgres) ListContracts(ctx context.Context, network string) ([]Contract, error) {
 	rows, err := p.pool.Query(ctx, listContractsSQL, network)
@@ -130,13 +133,38 @@ func (p *Postgres) ListContracts(ctx context.Context, network string) ([]Contrac
 	return contracts, nil
 }
 
+// ListContractsPage implements Store.
+func (p *Postgres) ListContractsPage(ctx context.Context, network string, limit, offset int) ([]Contract, error) {
+	if err := validatePage(limit, offset); err != nil {
+		return nil, err
+	}
+	rows, err := p.pool.Query(ctx, listContractsPageSQL, network, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list contracts page: %w", err)
+	}
+	defer rows.Close()
+
+	contracts := []Contract{}
+	for rows.Next() {
+		c, err := scanContract(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list contracts page: %w", err)
+		}
+		contracts = append(contracts, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list contracts page: %w", err)
+	}
+	return contracts, nil
+}
+
 const recordDeploymentSQL = `
 INSERT INTO deployments (
-    alias, network, contract_id, wasm_hash, action, deployer_pubkey, tx_hash, ledger, notes
+    alias, network, contract_id, wasm_hash, action, deployer_pubkey, tx_hash, ledger, git_commit, dirty, fee_charged, notes, ci_run_url, fn_name, fn_args
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 RETURNING id, alias, network, contract_id, wasm_hash, action,
-          deployer_pubkey, tx_hash, ledger, notes, created_at`
+		deployer_pubkey, tx_hash, ledger, git_commit, dirty, fee_charged, notes, ci_run_url, fn_name, fn_args, created_at`
 
 // RecordDeployment implements Store.
 func (p *Postgres) RecordDeployment(ctx context.Context, d Deployment) (Deployment, error) {
@@ -161,9 +189,34 @@ func (p *Postgres) RecordDeployment(ctx context.Context, d Deployment) (Deployme
 		notes = &d.Notes
 	}
 
+	var feeCharged *int64
+	if d.FeeCharged != nil {
+		feeCharged = d.FeeCharged
+	}
+	var gitCommit *string
+	if d.GitCommit != "" {
+		gitCommit = &d.GitCommit
+	}
+	var dirty *bool
+	if d.GitCommit != "" {
+		dirty = &d.Dirty
+	}
+	var ciRunURL *string
+	if d.CIRunURL != "" {
+		ciRunURL = &d.CIRunURL
+	}
+	var fnName *string
+	if d.FnName != "" {
+		fnName = &d.FnName
+	}
+	var fnArgs *string
+	if d.FnArgs != "" {
+		fnArgs = &d.FnArgs
+	}
+
 	row := p.pool.QueryRow(ctx, recordDeploymentSQL,
 		d.Alias, d.Network, d.ContractID, d.WasmHash, string(d.Action),
-		d.DeployerPubkey, txHash, ledger, notes)
+		d.DeployerPubkey, txHash, ledger, gitCommit, dirty, feeCharged, notes, ciRunURL, fnName, fnArgs)
 
 	out, err := scanDeployment(row)
 	if err != nil {
@@ -174,10 +227,13 @@ func (p *Postgres) RecordDeployment(ctx context.Context, d Deployment) (Deployme
 
 const historySQL = `
 SELECT id, alias, network, contract_id, wasm_hash, action,
-       deployer_pubkey, tx_hash, ledger, notes, created_at
+	deployer_pubkey, tx_hash, ledger, git_commit, dirty, fee_charged, notes, ci_run_url, fn_name, fn_args, created_at
 FROM deployments
 WHERE network = $1 AND alias = $2
 ORDER BY created_at DESC, id DESC`
+
+const historyPageSQL = historySQL + `
+LIMIT $3 OFFSET $4`
 
 // History implements Store.
 //
@@ -205,9 +261,34 @@ func (p *Postgres) History(ctx context.Context, network, alias string) ([]Deploy
 	return deployments, nil
 }
 
+// HistoryPage implements Store.
+func (p *Postgres) HistoryPage(ctx context.Context, network, alias string, limit, offset int) ([]Deployment, error) {
+	if err := validatePage(limit, offset); err != nil {
+		return nil, err
+	}
+	rows, err := p.pool.Query(ctx, historyPageSQL, network, alias, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("history page for %s/%s: %w", network, alias, err)
+	}
+	defer rows.Close()
+
+	deployments := []Deployment{}
+	for rows.Next() {
+		d, err := scanDeployment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("history page for %s/%s: %w", network, alias, err)
+		}
+		deployments = append(deployments, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("history page for %s/%s: %w", network, alias, err)
+	}
+	return deployments, nil
+}
+
 const listAllDeploymentsSQL = `
 SELECT id, alias, network, contract_id, wasm_hash, action,
-       deployer_pubkey, tx_hash, ledger, notes, created_at
+	deployer_pubkey, tx_hash, ledger, git_commit, dirty, fee_charged, notes, ci_run_url, fn_name, fn_args, created_at
 FROM deployments
 ORDER BY id`
 
@@ -249,7 +330,8 @@ func (p *Postgres) importSnapshot(ctx context.Context, contracts []Contract, dep
 	for _, c := range contracts {
 		if _, err := tx.Exec(ctx, `
 INSERT INTO contracts (id, alias, network, contract_id, current_wasm_hash, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7) OVERRIDING SYSTEM VALUE`,
+OVERRIDING SYSTEM VALUE
+VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 			c.ID, c.Alias, c.Network, c.ContractID, c.CurrentWasmHash, c.CreatedAt, c.UpdatedAt); err != nil {
 			return fmt.Errorf("postgres import contract %s/%s: %w", c.Network, c.Alias, err)
 		}
@@ -265,16 +347,20 @@ VALUES ($1, $2, $3, $4, $5, $6, $7) OVERRIDING SYSTEM VALUE`,
 			l := int64(d.Ledger)
 			ledger = &l
 		}
-		var notes *string
-		if d.Notes != "" {
-			notes = &d.Notes
+		// dirty is only meaningful alongside a commit, as in RecordDeployment.
+		var dirty *bool
+		if d.GitCommit != "" {
+			dirty = &d.Dirty
 		}
 		if _, err := tx.Exec(ctx, `
 INSERT INTO deployments (id, alias, network, contract_id, wasm_hash, action,
-                         deployer_pubkey, tx_hash, ledger, notes, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) OVERRIDING SYSTEM VALUE`,
+                         deployer_pubkey, tx_hash, ledger, git_commit, dirty, fee_charged,
+                         notes, ci_run_url, fn_name, fn_args, created_at)
+OVERRIDING SYSTEM VALUE
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
 			d.ID, d.Alias, d.Network, d.ContractID, d.WasmHash, string(d.Action),
-			d.DeployerPubkey, txHash, ledger, notes, d.CreatedAt); err != nil {
+			d.DeployerPubkey, txHash, ledger, optionalText(d.GitCommit), dirty, d.FeeCharged,
+			optionalText(d.Notes), optionalText(d.CIRunURL), optionalText(d.FnName), optionalText(d.FnArgs), d.CreatedAt); err != nil {
 			return fmt.Errorf("postgres import deployment %d: %w", d.ID, err)
 		}
 	}
@@ -299,6 +385,14 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) OVERRIDING SYSTEM VALUE`,
 	return nil
 }
 
+// optionalText stores an empty optional field as NULL, as RecordDeployment does.
+func optionalText(v string) *string {
+	if v == "" {
+		return nil
+	}
+	return &v
+}
+
 // scanner is satisfied by both pgx.Row and pgx.Rows, so the column lists below
 // are written once rather than duplicated for single-row and multi-row reads.
 type scanner interface {
@@ -313,14 +407,20 @@ func scanContract(s scanner) (Contract, error) {
 
 func scanDeployment(s scanner) (Deployment, error) {
 	var (
-		d      Deployment
-		action string
-		txHash *string
-		ledger *int64
-		notes  *string
+		d           Deployment
+		action      string
+		txHash      *string
+		ledger      *int64
+		txGitCommit *string
+		txDirty     *bool
+		txFee       *int64
+		notes       *string
+		ciRunURL    *string
+		fnName      *string
+		fnArgs      *string
 	)
 	err := s.Scan(&d.ID, &d.Alias, &d.Network, &d.ContractID, &d.WasmHash, &action,
-		&d.DeployerPubkey, &txHash, &ledger, &notes, &d.CreatedAt)
+		&d.DeployerPubkey, &txHash, &ledger, &txGitCommit, &txDirty, &txFee, &notes, &ciRunURL, &fnName, &fnArgs, &d.CreatedAt)
 	if err != nil {
 		return Deployment{}, err
 	}
@@ -332,8 +432,26 @@ func scanDeployment(s scanner) (Deployment, error) {
 	if ledger != nil {
 		d.Ledger = uint32(*ledger)
 	}
+	if txGitCommit != nil {
+		d.GitCommit = *txGitCommit
+	}
+	if txDirty != nil {
+		d.Dirty = *txDirty
+	}
+	if txFee != nil {
+		d.FeeCharged = txFee
+	}
 	if notes != nil {
 		d.Notes = *notes
+	}
+	if ciRunURL != nil {
+		d.CIRunURL = *ciRunURL
+	}
+	if fnName != nil {
+		d.FnName = *fnName
+	}
+	if fnArgs != nil {
+		d.FnArgs = *fnArgs
 	}
 	return d, nil
 }

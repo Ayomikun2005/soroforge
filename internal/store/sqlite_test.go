@@ -42,7 +42,8 @@ func newSQLiteStore(t *testing.T) store.Store {
 // exercising the exact scheme operators configure.
 func sqliteFileURL(t *testing.T) string {
 	t.Helper()
-	return store.SQLiteURLPrefix + filepath.Join(t.TempDir(), "history.db")
+	// ToSlash keeps a Windows temp path parseable as a URL; a no-op elsewhere.
+	return store.SQLiteURLPrefix + filepath.ToSlash(filepath.Join(t.TempDir(), "history.db"))
 }
 
 func TestSQLiteStore(t *testing.T) {
@@ -71,13 +72,13 @@ func TestSQLiteMigrationsAreReversible(t *testing.T) {
 	version, dirty, err := migrator.Version()
 	require.NoError(t, err)
 	require.False(t, dirty, "migrations must not leave the database dirty")
-	require.Equal(t, uint(2), version)
+	require.Equal(t, uint(4), version)
 
 	require.NoError(t, migrator.Down())
 	version, dirty, err = migrator.Version()
 	require.NoError(t, err)
 	require.False(t, dirty)
-	require.Equal(t, uint(1), version)
+	require.Equal(t, uint(3), version)
 
 	require.NoError(t, migrator.Up())
 }
@@ -176,8 +177,47 @@ func dialectSchema(t *testing.T, dir string) (map[string][]string, map[string]bo
 		for _, m := range indexRE.FindAllStringSubmatch(sql, -1) {
 			indexes[m[1]] = true
 		}
+		applyColumnAlters(tables, sql)
 	}
 	return tables, indexes
+}
+
+var (
+	alterTableRE = regexp.MustCompile(`(?is)^\s*ALTER\s+TABLE\s+(\w+)\s+(.*)$`)
+	addColumnRE  = regexp.MustCompile(`(?i)\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)`)
+	dropColumnRE = regexp.MustCompile(`(?i)\bDROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?(\w+)`)
+)
+
+// applyColumnAlters folds ALTER TABLE ... ADD/DROP COLUMN statements into
+// tables. Postgres adds several columns in one statement and SQLite one per
+// statement, so statements are split on ';' and every clause is read.
+func applyColumnAlters(tables map[string][]string, sql string) {
+	var body strings.Builder
+	for _, line := range strings.Split(sql, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "--") {
+			body.WriteString(line)
+			body.WriteString("\n")
+		}
+	}
+	for _, stmt := range strings.Split(body.String(), ";") {
+		m := alterTableRE.FindStringSubmatch(stmt)
+		if m == nil {
+			continue
+		}
+		table := m[1]
+		for _, add := range addColumnRE.FindAllStringSubmatch(m[2], -1) {
+			tables[table] = append(tables[table], strings.ToLower(add[1]))
+		}
+		for _, drop := range dropColumnRE.FindAllStringSubmatch(m[2], -1) {
+			kept := tables[table][:0]
+			for _, c := range tables[table] {
+				if c != strings.ToLower(drop[1]) {
+					kept = append(kept, c)
+				}
+			}
+			tables[table] = kept
+		}
+	}
 }
 
 var renameToRE = regexp.MustCompile(`(?i)ALTER\s+TABLE\s+\w+\s+RENAME\s+TO\s+(\w+)`)

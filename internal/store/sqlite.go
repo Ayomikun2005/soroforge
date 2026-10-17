@@ -201,14 +201,42 @@ func (s *SQLite) ListContracts(ctx context.Context, network string) ([]Contract,
 	return contracts, nil
 }
 
+// ListContractsPage implements Store with the same filter and ordering as
+// ListContracts.
+func (s *SQLite) ListContractsPage(ctx context.Context, network string, limit, offset int) ([]Contract, error) {
+	if err := validatePage(limit, offset); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, sqliteListContracts+"\nLIMIT ? OFFSET ?", network, network, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list contracts page: %w", err)
+	}
+	defer rows.Close()
+
+	contracts := []Contract{}
+	for rows.Next() {
+		c, err := scanSQLiteContract(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list contracts page: %w", err)
+		}
+		contracts = append(contracts, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list contracts page: %w", err)
+	}
+	return contracts, nil
+}
+
 const sqliteRecordDeployment = `
 INSERT INTO deployments (
     alias, network, contract_id, wasm_hash, action, deployer_pubkey,
-    tx_hash, ledger, notes, created_at
+    tx_hash, ledger, git_commit, dirty, fee_charged, notes,
+    ci_run_url, fn_name, fn_args, created_at
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 RETURNING id, alias, network, contract_id, wasm_hash, action,
-          deployer_pubkey, tx_hash, ledger, notes, created_at`
+          deployer_pubkey, tx_hash, ledger, git_commit, dirty, fee_charged,
+          notes, ci_run_url, fn_name, fn_args, created_at`
 
 // RecordDeployment implements Store.
 func (s *SQLite) RecordDeployment(ctx context.Context, d Deployment) (Deployment, error) {
@@ -218,7 +246,9 @@ func (s *SQLite) RecordDeployment(ctx context.Context, d Deployment) (Deployment
 	row := s.db.QueryRowContext(ctx, sqliteRecordDeployment,
 		d.Alias, d.Network, d.ContractID, d.WasmHash, string(d.Action),
 		d.DeployerPubkey, nullableString(d.TxHash), nullableInt64(int64(d.Ledger)),
-		nullableString(d.Notes), formatSQLiteTime(time.Now().UTC()))
+		nullableString(d.GitCommit), nullableDirty(d), nullableFee(d.FeeCharged), nullableString(d.Notes),
+		nullableString(d.CIRunURL), nullableString(d.FnName), nullableString(d.FnArgs),
+		formatSQLiteTime(time.Now().UTC()))
 
 	out, err := scanSQLiteDeployment(row)
 	if err != nil {
@@ -229,7 +259,8 @@ func (s *SQLite) RecordDeployment(ctx context.Context, d Deployment) (Deployment
 
 const sqliteHistory = `
 SELECT id, alias, network, contract_id, wasm_hash, action,
-       deployer_pubkey, tx_hash, ledger, notes, created_at
+       deployer_pubkey, tx_hash, ledger, git_commit, dirty, fee_charged,
+       notes, ci_run_url, fn_name, fn_args, created_at
 FROM deployments
 WHERE network = ? AND alias = ?
 ORDER BY created_at DESC, id DESC`
@@ -257,9 +288,36 @@ func (s *SQLite) History(ctx context.Context, network, alias string) ([]Deployme
 	return deployments, nil
 }
 
+// HistoryPage implements Store, in the same newest-first order as History so
+// pages concatenate to the full log.
+func (s *SQLite) HistoryPage(ctx context.Context, network, alias string, limit, offset int) ([]Deployment, error) {
+	if err := validatePage(limit, offset); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, sqliteHistory+"\nLIMIT ? OFFSET ?", network, alias, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("history page for %s/%s: %w", network, alias, err)
+	}
+	defer rows.Close()
+
+	deployments := []Deployment{}
+	for rows.Next() {
+		d, err := scanSQLiteDeployment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("history page for %s/%s: %w", network, alias, err)
+		}
+		deployments = append(deployments, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("history page for %s/%s: %w", network, alias, err)
+	}
+	return deployments, nil
+}
+
 const sqliteListAllDeployments = `
 SELECT id, alias, network, contract_id, wasm_hash, action,
-       deployer_pubkey, tx_hash, ledger, notes, created_at
+       deployer_pubkey, tx_hash, ledger, git_commit, dirty, fee_charged,
+       notes, ci_run_url, fn_name, fn_args, created_at
 FROM deployments
 ORDER BY id`
 
@@ -317,13 +375,28 @@ func scanSQLiteDeployment(s rowScanner) (Deployment, error) {
 		createdAt     string
 		txHash, notes sql.NullString
 		ledger        sql.NullInt64
+		gitCommit     sql.NullString
+		dirty         sql.NullBool
+		fee           sql.NullInt64
+		ciRunURL      sql.NullString
+		fnName        sql.NullString
+		fnArgs        sql.NullString
 	)
 	if err := s.Scan(&d.ID, &d.Alias, &d.Network, &d.ContractID, &d.WasmHash, &action,
-		&d.DeployerPubkey, &txHash, &ledger, &notes, &createdAt); err != nil {
+		&d.DeployerPubkey, &txHash, &ledger, &gitCommit, &dirty, &fee,
+		&notes, &ciRunURL, &fnName, &fnArgs, &createdAt); err != nil {
 		return Deployment{}, err
 	}
 
 	d.Action = Action(action)
+	d.GitCommit = gitCommit.String
+	d.Dirty = dirty.Valid && dirty.Bool
+	if fee.Valid {
+		d.FeeCharged = &fee.Int64
+	}
+	d.CIRunURL = ciRunURL.String
+	d.FnName = fnName.String
+	d.FnArgs = fnArgs.String
 	if txHash.Valid {
 		d.TxHash = txHash.String
 	}
@@ -354,6 +427,24 @@ func nullableInt64(v int64) any {
 	return v
 }
 
+// nullableFee keeps a zero fee distinct from an unknown one: only a nil
+// pointer is NULL, matching the Postgres store.
+func nullableFee(v *int64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+// nullableDirty records the dirty flag only alongside a commit, as the
+// Postgres store does; without a commit there is no working tree to describe.
+func nullableDirty(d Deployment) any {
+	if d.GitCommit == "" {
+		return nil
+	}
+	return d.Dirty
+}
+
 // importSnapshot implements snapshotImporter for SQLite.
 //
 // Explicit ids insert cleanly: a plain INTEGER PRIMARY KEY is the rowid, and
@@ -380,11 +471,14 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	for _, d := range deployments {
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO deployments (id, alias, network, contract_id, wasm_hash, action,
-                         deployer_pubkey, tx_hash, ledger, notes, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                         deployer_pubkey, tx_hash, ledger, git_commit, dirty, fee_charged,
+                         notes, ci_run_url, fn_name, fn_args, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			d.ID, d.Alias, d.Network, d.ContractID, d.WasmHash, string(d.Action),
 			d.DeployerPubkey, nullableString(d.TxHash), nullableInt64(int64(d.Ledger)),
-			nullableString(d.Notes), formatSQLiteTime(d.CreatedAt)); err != nil {
+			nullableString(d.GitCommit), nullableDirty(d), nullableFee(d.FeeCharged), nullableString(d.Notes),
+			nullableString(d.CIRunURL), nullableString(d.FnName), nullableString(d.FnArgs),
+			formatSQLiteTime(d.CreatedAt)); err != nil {
 			return fmt.Errorf("sqlite import deployment %d: %w", d.ID, err)
 		}
 	}
