@@ -205,6 +205,100 @@ func (p *Postgres) History(ctx context.Context, network, alias string) ([]Deploy
 	return deployments, nil
 }
 
+const listAllDeploymentsSQL = `
+SELECT id, alias, network, contract_id, wasm_hash, action,
+       deployer_pubkey, tx_hash, ledger, notes, created_at
+FROM deployments
+ORDER BY id`
+
+// ListAllDeployments implements Store.
+func (p *Postgres) ListAllDeployments(ctx context.Context) ([]Deployment, error) {
+	rows, err := p.pool.Query(ctx, listAllDeploymentsSQL)
+	if err != nil {
+		return nil, fmt.Errorf("list deployments: %w", err)
+	}
+	defer rows.Close()
+
+	deployments := []Deployment{}
+	for rows.Next() {
+		d, err := scanDeployment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("list deployments: %w", err)
+		}
+		deployments = append(deployments, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list deployments: %w", err)
+	}
+	return deployments, nil
+}
+
+// importSnapshot implements snapshotImporter for Postgres.
+//
+// The identity columns are GENERATED ALWAYS, so inserting recorded ids needs
+// OVERRIDING SYSTEM VALUE, and the backing sequences must then be moved past
+// the imported ids — otherwise the next deploy collides on a duplicate key.
+// The whole import runs in one transaction: half a history is worse than none.
+func (p *Postgres) importSnapshot(ctx context.Context, contracts []Contract, deployments []Deployment) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres import: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, c := range contracts {
+		if _, err := tx.Exec(ctx, `
+INSERT INTO contracts (id, alias, network, contract_id, current_wasm_hash, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7) OVERRIDING SYSTEM VALUE`,
+			c.ID, c.Alias, c.Network, c.ContractID, c.CurrentWasmHash, c.CreatedAt, c.UpdatedAt); err != nil {
+			return fmt.Errorf("postgres import contract %s/%s: %w", c.Network, c.Alias, err)
+		}
+	}
+
+	for _, d := range deployments {
+		var txHash *string
+		if d.TxHash != "" {
+			txHash = &d.TxHash
+		}
+		var ledger *int64
+		if d.Ledger != 0 {
+			l := int64(d.Ledger)
+			ledger = &l
+		}
+		var notes *string
+		if d.Notes != "" {
+			notes = &d.Notes
+		}
+		if _, err := tx.Exec(ctx, `
+INSERT INTO deployments (id, alias, network, contract_id, wasm_hash, action,
+                         deployer_pubkey, tx_hash, ledger, notes, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) OVERRIDING SYSTEM VALUE`,
+			d.ID, d.Alias, d.Network, d.ContractID, d.WasmHash, string(d.Action),
+			d.DeployerPubkey, txHash, ledger, notes, d.CreatedAt); err != nil {
+			return fmt.Errorf("postgres import deployment %d: %w", d.ID, err)
+		}
+	}
+
+	// setval(..., max(id)) marks the sequence as having just produced that
+	// value, so the next identity is max+1. COALESCE keeps an empty table on
+	// safe ground (sequence restarts at 1).
+	for _, seq := range []struct{ table, column string }{
+		{"contracts", "id"},
+		{"deployments", "id"},
+	} {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(
+			`SELECT setval(pg_get_serial_sequence('%s', '%s'), (SELECT COALESCE(MAX(id), 1) FROM %s))`,
+			seq.table, seq.column, seq.table)); err != nil {
+			return fmt.Errorf("postgres import: advance %s sequence: %w", seq.table, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres import: commit: %w", err)
+	}
+	return nil
+}
+
 // scanner is satisfied by both pgx.Row and pgx.Rows, so the column lists below
 // are written once rather than duplicated for single-row and multi-row reads.
 type scanner interface {
